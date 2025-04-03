@@ -21,6 +21,7 @@ GOOGLE_API_KEY = "GOOGLE_API_KEY_HERE"
 
 openai.api_key = OPENAI_API_KEY
 
+# The actual json file is in the project, I just didn't provide it.
 credentials_path = "/PATH/TO/JSON"
 credentials = service_account.Credentials.from_service_account_file(credentials_path)
 client = texttospeech.TextToSpeechClient(credentials=credentials)
