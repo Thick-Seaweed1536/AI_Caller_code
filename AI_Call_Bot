@@ -1,0 +1,166 @@
+import os
+import time
+import requests
+from flask import Flask, request, send_file
+from twilio.twiml.voice_response import VoiceResponse, Gather
+import openai
+from google.cloud import texttospeech
+from google.oauth2 import service_account
+
+# I currently host it locally using servio, other services will work but this is my preference
+app = Flask(__name__)
+
+# I had to take out my actually credentials so I don't get my money stolen by being charged EXTRA API usage
+# Also for the google api it is limited on 5 real estate sites I set for the best possible results(zillow, homes.com, HAR.com, Realitor.com and remax.com)
+TWILIO_NUMBER = "TWILIO_NUMBER_HERE"
+OPENAI_API_KEY = "OPENAI_API_KEY_HERE"
+GOOGLE_SEARCH_API_KEY = "GOOGLE_SEARCH_API_KEY_HERE"
+GOOGLE_SEARCH_ENGINE_ID = "GOOGLE_SEARCH_ENGINE_ID_HERE"
+GOOGLE_API_KEY = "GOOGLE_API_KEY_HERE"
+
+
+openai.api_key = OPENAI_API_KEY
+
+credentials_path = "/PATH/TO/JSON"
+credentials = service_account.Credentials.from_service_account_file(credentials_path)
+client = texttospeech.TextToSpeechClient(credentials=credentials)
+
+conversation_history = []
+has_greeted = False
+user_criteria = {}
+
+@app.route("/ivr", methods=["POST"])
+def ivr():
+    global has_greeted
+    response = VoiceResponse()
+    gather = Gather(input="speech dtmf", timeout=5, num_digits=1, action="/handle-input", method="POST")
+
+    if not has_greeted:
+        gather.say("Thank you for calling Silverstone Realty. Press or say the number for the department you need. "
+                   "Press 1 for our listings, "
+                   "Press 2 to be connected to our sales department, "
+                   "Press 3 for more information about our company", voice="en-US-Wavenet-D")
+        has_greeted = True
+    else:
+        gather.say("Please select from the options, Press 1 for our listings, "
+                   "Press 2 to be connected to our sales department, "
+                   "Press 3 for more information about our company", voice="en-US-Wavenet-D")
+
+    response.append(gather)
+    return str(response)
+
+@app.route("/handle-input", methods=["POST"])
+def handle_input():
+    global conversation_history, user_criteria
+    digit_pressed = request.form.get("Digits")
+    speech_input = request.form.get("SpeechResult", "").strip().lower()
+
+    response = VoiceResponse()
+    subjects = {"1": "Listings", "2": "Sales", "3": "For information"}
+    subject = subjects.get(digit_pressed) if digit_pressed in subjects else None
+
+    if not subject and speech_input:
+        for key, subj in subjects.items():
+            if key in speech_input or any(word in speech_input for word in subj.split()):
+                subject = subj
+                break
+
+    conversation_history.append({
+        "role": "system",
+        "content": f"Act as if you are a secretary at Silverstone Realty, answering calls for their call center. "
+                   f"The customers will call in and ask for listings, in which you will perform Google searches for "
+                   f"listings based on their criteria, as long as it pertains to their requested {subject}. "
+                   f"When answering the phone, you will always greet and state your name, but only when answering the phone. "
+                   f"If the customer does not respond, either restate the question in a nice manner or if you did not ask a question, "
+                   f"go to a second response as a follow-up to your previous message. "
+                   f"When providing listing data, say 5 listing details but not the URLs, and ask if they want a showing for a specific property."
+    })
+
+    ai_message = generate_ai_response(conversation_history)
+    audio_url = generate_audio_stream(ai_message)
+    response.play(audio_url)
+
+    gather = Gather(input="speech", timeout=5, action="/gather-criteria" if subject == "Listings" else "/continue-conversation", method="POST")
+    response.append(gather)
+    
+    return str(response)
+
+@app.route("/continue-conversation", methods=["POST"])
+def continue_conversation():
+    global conversation_history
+    user_response = request.form.get("SpeechResult", "").strip()
+    response = VoiceResponse()
+    
+    if not user_response:
+        response.say("I didn't hear anything. Please try again.", voice="en-US-Wavenet-D")
+        return str(response)
+    
+    conversation_history.append({"role": "user", "content": user_response})
+    ai_message = generate_ai_response(conversation_history)
+    audio_url = generate_audio_stream(ai_message)
+    response.play(audio_url)
+
+    gather = Gather(input="speech dtmf", timeout=5, action="/continue-conversation", method="POST")
+    response.append(gather)
+    
+    return str(response)
+
+@app.route("/gather-criteria", methods=["POST"])
+def gather_criteria():
+    global user_criteria
+    user_response = request.form.get("SpeechResult", "").strip()
+    response = VoiceResponse()
+    
+    if not user_response:
+        response.say("I didn't hear anything. Please try again.", voice="en-US-Wavenet-D")
+        return str(response)
+    
+    user_criteria["preferences"] = user_response
+    conversation_history.append({"role": "user", "content": user_response})
+    ai_message = generate_ai_response(conversation_history)
+    audio_url = generate_audio_stream(ai_message)
+    response.play(audio_url)
+    
+    response.say("Thank you for your input. We will provide the best listings based on your criteria.", voice="en-US-Wavenet-D")
+    
+    return str(response)
+
+def generate_ai_response(history):
+    ai_response = openai.ChatCompletion.create(
+        model="gpt-4",
+        messages=history,
+        max_tokens=500,
+        temperature=0.1
+    )
+    return ai_response['choices'][0]['message']['content'].strip()
+
+def generate_audio_stream(text):
+    synthesis_input = texttospeech.SynthesisInput(text=text)
+
+    voice = texttospeech.VoiceSelectionParams(
+        language_code="en-US",
+        ssml_gender=texttospeech.SsmlVoiceGender.FEMALE
+    )
+
+    audio_config = texttospeech.AudioConfig(
+        audio_encoding=texttospeech.AudioEncoding.MP3
+    )
+
+    response = client.synthesize_speech(
+        input=synthesis_input,
+        voice=voice,
+        audio_config=audio_config
+    )
+
+    output_path = f"speech_{int(time.time())}.mp3"
+    with open(output_path, "wb") as out:
+        out.write(response.audio_content)
+
+    return f"/{output_path}"
+
+@app.route("/<filename>", methods=["GET"])
+def serve_audio(filename):
+    return send_file(filename, mimetype="audio/mp3")
+
+if __name__ == "__main__":
+   app.run(debug=True, host="0.0.0.0", port=5000)
